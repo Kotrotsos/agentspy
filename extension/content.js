@@ -26,3 +26,20 @@ window.addEventListener("message", (event) => {
     });
   }
 });
+
+// Forward "scan" commands from the popup/background into the page world,
+// where the injected interceptor can use the page's fetch (with cookies).
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (!msg || msg.source !== "agentspy-cmd") return;
+  if (msg.type === "scan") {
+    const convoId =
+      msg.conversationId ||
+      (location.pathname.match(/\/c\/([0-9a-fA-F-]{8,})/) || [])[1] ||
+      null;
+    window.postMessage(
+      { source: "agentspy-cmd", type: "scan", conversationId: convoId },
+      "*"
+    );
+    sendResponse({ ok: true, conversationId: convoId });
+  }
+});

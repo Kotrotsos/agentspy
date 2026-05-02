@@ -187,6 +187,7 @@
     const reader = response.body.getReader();
     const decoder = new TextDecoder("utf-8");
     let buffer = "";
+    let sawWebTool = false;
     try {
       while (true) {
         const { value, done } = await reader.read();
@@ -195,10 +196,66 @@
         if (buffer.length > 2_000_000) {
           buffer = buffer.slice(-1_000_000);
         }
+        if (!sawWebTool && /"recipient"\s*:\s*"web"|search_result_group|"queries"\s*:\s*\[/.test(buffer)) {
+          sawWebTool = true;
+        }
         extractQueries(buffer, convoId, url);
       }
     } catch {}
+    // Stream ended. The live POST stream rarely contains the queries in a
+    // parseable shape; the queries appear in the conversation tree fetched
+    // by GET /backend-api/conversation/{id}. After a search-enabled turn,
+    // re-fetch the tree so we can extract the queries.
+    if (!convoId) {
+      const m = buffer.match(/"conversation_id"\s*:\s*"([0-9a-fA-F-]{8,})"/);
+      if (m) convoId = m[1];
+    }
+    if (convoId && sawWebTool) {
+      scheduleConversationScan(convoId, 1500);
+    }
   }
+
+  // Re-fetch the conversation tree to extract search queries that aren't in
+  // the live stream. Debounced per conversation.
+  const scanTimers = new Map();
+  function scheduleConversationScan(convoId, delayMs) {
+    if (!convoId) return;
+    if (scanTimers.has(convoId)) clearTimeout(scanTimers.get(convoId));
+    scanTimers.set(
+      convoId,
+      setTimeout(() => {
+        scanTimers.delete(convoId);
+        scanConversation(convoId);
+      }, delayMs)
+    );
+  }
+
+  async function scanConversation(convoId) {
+    if (!convoId) return;
+    try {
+      const res = await origFetch.call(
+        window,
+        "/backend-api/conversation/" + encodeURIComponent(convoId),
+        { credentials: "include", headers: { Accept: "application/json" } }
+      );
+      if (!res || !res.ok) return;
+      const text = await res.text();
+      extractQueries(text, convoId, "/backend-api/conversation/" + convoId);
+    } catch {}
+  }
+
+  // Listen for a manual scan trigger from the popup.
+  window.addEventListener("message", (event) => {
+    if (event.source !== window) return;
+    const data = event.data;
+    if (!data || data.source !== "agentspy-cmd") return;
+    if (data.type === "scan") {
+      const convoId =
+        data.conversationId ||
+        (location.pathname.match(/\/c\/([0-9a-fA-F-]{8,})/) || [])[1];
+      if (convoId) scanConversation(convoId);
+    }
+  });
 
   // ---- XMLHttpRequest wrapper -----------------------------------------
 

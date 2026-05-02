@@ -6,6 +6,7 @@ const $count = document.getElementById("count");
 const $clear = document.getElementById("clear");
 const $copyCsv = document.getElementById("copy-csv");
 const $copyJson = document.getElementById("copy-json");
+const $scan = document.getElementById("scan");
 
 function el(tag, opts = {}, children = []) {
   const node = document.createElement(tag);
@@ -133,14 +134,14 @@ async function load() {
   render(Array.isArray(data[STORAGE_KEY]) ? data[STORAGE_KEY] : []);
 }
 
-function flashButton(btn) {
+function flashButton(btn, label, ms) {
   btn.classList.add("copied");
   const orig = btn.textContent;
-  btn.textContent = "copied";
+  btn.textContent = label || "copied";
   setTimeout(() => {
     btn.classList.remove("copied");
     btn.textContent = orig;
-  }, 1200);
+  }, ms || 1200);
 }
 
 function toCsv(records) {
@@ -158,6 +159,27 @@ function toCsv(records) {
   );
   return [header, ...rows].join("\n");
 }
+
+$scan.addEventListener("click", async () => {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab || !tab.url || !/^https:\/\/(chatgpt\.com|chat\.openai\.com)\//.test(tab.url)) {
+    flashButton($scan, "open chatgpt", 1800);
+    return;
+  }
+  try {
+    const resp = await chrome.tabs.sendMessage(tab.id, {
+      source: "agentspy-cmd",
+      type: "scan",
+    });
+    if (resp && resp.conversationId) {
+      flashButton($scan, "scanning…", 1500);
+    } else {
+      flashButton($scan, "no convo id", 1500);
+    }
+  } catch {
+    flashButton($scan, "reload tab", 1800);
+  }
+});
 
 $clear.addEventListener("click", async () => {
   if (!confirm("Clear all captured queries?")) return;
