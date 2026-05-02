@@ -10,6 +10,10 @@
 (function () {
   if (window.__agentspy_installed) return;
   window.__agentspy_installed = true;
+  // Toggle in DevTools console: window.__agentspy_debug = false
+  if (typeof window.__agentspy_debug === "undefined") {
+    window.__agentspy_debug = true;
+  }
 
   const TARGET_PATH = /\/backend-api\/(?:f\/)?conversation/;
 
@@ -57,27 +61,47 @@
     }
   }
 
+  function tryEmit(q, conversationId, url, source) {
+    if (!q || typeof q !== "string") return;
+    const trimmed = q.trim();
+    if (trimmed.length < 2 || trimmed.length > 500) return;
+    emitQuery(trimmed, conversationId, url);
+    if (window.__agentspy_debug) {
+      console.log("[AgentSpy] query:", trimmed, "(via", source + ")");
+    }
+  }
+
   function extractQueries(text, conversationId, url) {
     if (!text || typeof text !== "string") return;
 
-    // Pattern A: "queries":["...", "..."] — most common search-tool payload.
-    const queriesArr = /"queries"\s*:\s*\[((?:\s*"(?:\\.|[^"\\])*"\s*,?)+)\]/g;
+    // Pattern A1: "queries":["...", "..."] — array of plain strings.
+    const queriesArr = /"queries"\s*:\s*\[([\s\S]*?)\]/g;
     let m;
     while ((m = queriesArr.exec(text)) !== null) {
       const inner = m[1];
-      const strRe = /"((?:\\.|[^"\\])*)"/g;
+
+      // A1a: keyed objects inside the array first (most specific).
+      const keyedRe = /"(?:text|q|query|search_query)"\s*:\s*"((?:\\.|[^"\\])*)"/g;
+      let foundKeyed = false;
       let s;
-      while ((s = strRe.exec(inner)) !== null) {
-        const q = safeJsonString(s[1]);
-        if (q && q.length > 1 && q.length < 500) emitQuery(q, conversationId, url);
+      while ((s = keyedRe.exec(inner)) !== null) {
+        foundKeyed = true;
+        tryEmit(safeJsonString(s[1]), conversationId, url, "queries[].keyed");
+      }
+
+      // A1b: if no keyed values, treat as array of plain strings.
+      if (!foundKeyed) {
+        const strRe = /"((?:\\.|[^"\\])*)"/g;
+        while ((s = strRe.exec(inner)) !== null) {
+          tryEmit(safeJsonString(s[1]), conversationId, url, "queries[].string");
+        }
       }
     }
 
     // Pattern B: search("...") or web.search("...") tool-call code.
     const searchCall = /\b(?:web\.)?search\(\s*"((?:\\.|[^"\\])*)"\s*\)/g;
     while ((m = searchCall.exec(text)) !== null) {
-      const q = safeJsonString(m[1]);
-      if (q && q.length > 1 && q.length < 500) emitQuery(q, conversationId, url);
+      tryEmit(safeJsonString(m[1]), conversationId, url, "search()");
     }
 
     // Pattern C: {"q": "..."} entries inside a search_query array.
@@ -87,22 +111,39 @@
       const qFieldRe = /"q"\s*:\s*"((?:\\.|[^"\\])*)"/g;
       let s;
       while ((s = qFieldRe.exec(inner)) !== null) {
-        const q = safeJsonString(s[1]);
-        if (q && q.length > 1 && q.length < 500) emitQuery(q, conversationId, url);
+        tryEmit(safeJsonString(s[1]), conversationId, url, "search_query[]");
       }
     }
 
-    // Pattern D: a recipient:"web" tool message with a text field that
-    // wraps a search() call. Narrower than Pattern B alone.
-    const recipientWeb = /"recipient"\s*:\s*"web"[\s\S]{0,400}?"text"\s*:\s*"((?:\\.|[^"\\])*)"/g;
+    // Pattern D: recipient:"web" tool message with a text field wrapping a
+    // search() call. Narrower than Pattern B alone.
+    const recipientWeb = /"recipient"\s*:\s*"web"[\s\S]{0,800}?"text"\s*:\s*"((?:\\.|[^"\\])*)"/g;
     while ((m = recipientWeb.exec(text)) !== null) {
       const raw = safeJsonString(m[1]);
       if (!raw) continue;
       const inner = /\b(?:web\.)?search\(\s*"((?:\\.|[^"\\])*)"\s*\)/g;
       let s;
       while ((s = inner.exec(raw)) !== null) {
-        const q = safeJsonString(s[1]);
-        if (q && q.length > 1 && q.length < 500) emitQuery(q, conversationId, url);
+        tryEmit(safeJsonString(s[1]), conversationId, url, "recipient=web");
+      }
+    }
+
+    // Pattern E: search_queries (plural variant of Pattern A).
+    const searchQueriesArr = /"search_queries"\s*:\s*\[([\s\S]*?)\]/g;
+    while ((m = searchQueriesArr.exec(text)) !== null) {
+      const inner = m[1];
+      const keyedRe = /"(?:text|q|query)"\s*:\s*"((?:\\.|[^"\\])*)"/g;
+      let s;
+      let foundKeyed = false;
+      while ((s = keyedRe.exec(inner)) !== null) {
+        foundKeyed = true;
+        tryEmit(safeJsonString(s[1]), conversationId, url, "search_queries[].keyed");
+      }
+      if (!foundKeyed) {
+        const strRe = /"((?:\\.|[^"\\])*)"/g;
+        while ((s = strRe.exec(inner)) !== null) {
+          tryEmit(safeJsonString(s[1]), conversationId, url, "search_queries[].string");
+        }
       }
     }
   }
@@ -187,7 +228,6 @@
     const reader = response.body.getReader();
     const decoder = new TextDecoder("utf-8");
     let buffer = "";
-    let sawWebTool = false;
     try {
       while (true) {
         const { value, done } = await reader.read();
@@ -196,22 +236,24 @@
         if (buffer.length > 2_000_000) {
           buffer = buffer.slice(-1_000_000);
         }
-        if (!sawWebTool && /"recipient"\s*:\s*"web"|search_result_group|"queries"\s*:\s*\[/.test(buffer)) {
-          sawWebTool = true;
-        }
         extractQueries(buffer, convoId, url);
       }
     } catch {}
     // Stream ended. The live POST stream rarely contains the queries in a
-    // parseable shape; the queries appear in the conversation tree fetched
-    // by GET /backend-api/conversation/{id}. After a search-enabled turn,
-    // re-fetch the tree so we can extract the queries.
+    // parseable shape — they live in the conversation tree fetched by
+    // GET /backend-api/conversation/{id}. Always re-fetch after a turn so
+    // we get the queries (cheap, just one extra request per chat reply).
     if (!convoId) {
       const m = buffer.match(/"conversation_id"\s*:\s*"([0-9a-fA-F-]{8,})"/);
       if (m) convoId = m[1];
     }
-    if (convoId && sawWebTool) {
+    if (convoId) {
+      if (window.__agentspy_debug) {
+        console.log("[AgentSpy] stream ended, scheduling tree scan for", convoId);
+      }
       scheduleConversationScan(convoId, 1500);
+    } else if (window.__agentspy_debug) {
+      console.log("[AgentSpy] stream ended but no conversation id found");
     }
   }
 
@@ -233,15 +275,43 @@
   async function scanConversation(convoId) {
     if (!convoId) return;
     try {
+      if (window.__agentspy_debug) {
+        console.log("[AgentSpy] fetching tree for", convoId);
+      }
       const res = await origFetch.call(
         window,
         "/backend-api/conversation/" + encodeURIComponent(convoId),
         { credentials: "include", headers: { Accept: "application/json" } }
       );
-      if (!res || !res.ok) return;
+      if (!res || !res.ok) {
+        if (window.__agentspy_debug) {
+          console.warn("[AgentSpy] tree fetch failed:", res && res.status);
+        }
+        return;
+      }
       const text = await res.text();
+      const before = seenQueries.size;
       extractQueries(text, convoId, "/backend-api/conversation/" + convoId);
-    } catch {}
+      const added = seenQueries.size - before;
+      if (window.__agentspy_debug) {
+        console.log(
+          "[AgentSpy] tree scan complete: " +
+            added +
+            " new queries (response " +
+            text.length +
+            " bytes)"
+        );
+        if (added === 0) {
+          // Sample the response so the user can paste it back if patterns miss.
+          window.__agentspy_last_response = text;
+          console.log(
+            "[AgentSpy] no queries matched. Inspect window.__agentspy_last_response in this tab to see the full payload."
+          );
+        }
+      }
+    } catch (e) {
+      if (window.__agentspy_debug) console.warn("[AgentSpy] scan error", e);
+    }
   }
 
   // Listen for a manual scan trigger from the popup.
@@ -288,5 +358,7 @@
     return origSend.apply(this, arguments);
   };
 
-  console.info("[AgentSpy] interceptor installed");
+  console.info(
+    "[AgentSpy] interceptor installed (debug on; set window.__agentspy_debug=false to silence)"
+  );
 })();

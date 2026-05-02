@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AgentSpy: ChatGPT Query Inspector",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Reveals the actual search queries ChatGPT sends to the web after rewriting your prompt. Useful for GEO (Generative Engine Optimization).",
   "permissions": ["storage"],
   "host_permissions": [
